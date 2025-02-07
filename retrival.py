@@ -2,113 +2,140 @@ import json
 import math
 import re
 import string
-from collections import defaultdict, Counter
-from nltk.stem.snowball import EnglishStemmer
+from collections import Counter, defaultdict
 from nltk.tokenize import TreebankWordTokenizer
+from nltk.stem.snowball import EnglishStemmer
 
-def preprocess_query(text, stopwords):
+def preprocess_text(text, stopwords):
     """
-    Preprocess the query text to match the document preprocessor:
+    Preprocess text in the same way as document processing:
       - Remove URLs.
       - Tokenize using TreebankWordTokenizer.
       - Convert tokens to lowercase.
-      - Remove punctuation and stopwords.
-      - Discard tokens containing any digits.
-      - Stem tokens using the EnglishStemmer.
+      - Remove tokens that are stopwords or are solely punctuation.
+      - Stem tokens using EnglishStemmer.
+      - Remove any residual punctuation using a translation table.
+      - Remove tokens that become stopwords after punctuation removal.
+      - Remove tokens that contain any numbers (only keep purely alphabetic tokens).
+      - Remove specific unwanted unicode characters (e.g., \u201d).
+      
+    Returns:
+        A list of processed tokens.
     """
-    # Remove URLs
-    text = re.sub(r"http\S+|https\S+|www\S+", "", text)
+    # Remove URLs (http, https, and www links)
+    text = re.sub(r"https?://\S+|www\.\S+", "", text)
     
+    # Initialize the tokenizer and stemmer
     tokenizer = TreebankWordTokenizer()
     stemmer = EnglishStemmer()
+    
+    # Tokenize the text
     tokens = tokenizer.tokenize(text)
-    processed_tokens = []
+    words = []
+    punct_set = set(string.punctuation)
     
+    # Process each token: lowercase, check stopwords/punctuation, and apply stemming
     for token in tokens:
-        # Lowercase and strip punctuation from the ends
-        token = token.lower().strip(string.punctuation)
-        if not token or token in stopwords:
+        token_lower = token.lower()
+        if token_lower in stopwords or token_lower in punct_set:
             continue
-        # Remove tokens containing digits
-        if re.search(r'\d', token):
-            continue
-        processed_tokens.append(stemmer.stem(token))
+        try:
+            stemmed = stemmer.stem(token_lower)
+            words.append(stemmed)
+        except Exception:
+            words.append(token_lower)
     
-    return processed_tokens
+    # Remove any residual punctuation from tokens using a translation table
+    table = str.maketrans('', '', string.punctuation)
+    words = [w.translate(table) for w in words]
+    
+    # Remove tokens that might have become stopwords after punctuation removal
+    words = [w for w in words if w not in stopwords]
+    
+    # Remove tokens that contain numbers (only keep purely alphabetic tokens)
+    words = [w for w in words if re.match(r'^[a-zA-Z]+$', w)]
+    
+    # Remove specific unwanted unicode characters (e.g., \u201d)
+    words = [w.replace(u"\u201d", "") for w in words]
+    
+    return words
 
-def build_query_vector(tokens, total_docs, inverted_index):
+def build_query_vector(tokens, weighted_dict, vocab_size):
     """
-    Build a query vector with weights computed as:
-        weight = (TF in query) * (IDF)
-    where IDF is computed as log(total_docs / df) for tokens that occur in the index.
-    Only tokens that appear in the inverted index are considered.
+    Compute a query vector using a normalized term frequency times idf.
+    Only tokens that exist in the weighted_dict (i.e. in the corpus vocabulary) are used.
+    
+    The weight formula used here is:
+       weight = (0.5 + 0.5*(tf / max_tf)) * idf
+    where idf = log(vocab_size / doc_freq, 2) and doc_freq is the number
+    of documents containing the term.
     """
-    tf_counts = Counter(tokens)
-    query_vector = {}
-    for token, tf in tf_counts.items():
-        if token in inverted_index:
-            df = inverted_index[token]["df"]
-            # Compute IDF using the same formula as indexing
-            idf = math.log(total_docs / df)
-            query_vector[token] = tf * idf
-    return query_vector
+    token_counts = Counter(tokens)
+    if not token_counts:
+        return {}
+    max_tf = max(token_counts.values())
+    q_vector = {}
+    for term, tf in token_counts.items():
+        if term in weighted_dict:
+            # In our weighted_dict, postings are stored as {doc_id: weight}
+            # But for the purpose of IDF calculation, we need the document frequency.
+            # We assume that the length of weighted_dict[term] gives the doc_freq.
+            doc_freq = len(weighted_dict[term])
+            idf = math.log(float(vocab_size) / doc_freq, 2)
+            q_vector[term] = (0.5 + 0.5 * (tf / float(max_tf))) * idf
+    return q_vector
 
-def compute_query_norm(query_vector):
-    """Compute the Euclidean norm of the query vector."""
-    return math.sqrt(sum(weight**2 for weight in query_vector.values()))
+def compute_document_norms(weighted_dict):
+    """
+    Precompute and return the Euclidean norm of each document vector.
+    The weighted_dict is a mapping: term -> {doc_id: weight}.
+    For each document, we sum the squared term weights (over all terms) and take the square root.
+    """
+    doc_norms = defaultdict(float)
+    for term, postings in weighted_dict.items():
+        for doc_id, weight in postings.items():
+            doc_norms[doc_id] += weight ** 2
+    # Convert to Euclidean norm by taking the square root
+    for doc_id in doc_norms:
+        doc_norms[doc_id] = math.sqrt(doc_norms[doc_id])
+    return doc_norms
 
-def retrieve_documents(query_vector, query_norm, inverted_index, doc_vector_lengths):
+def retrieve_documents(query_vector, weighted_dict):
     """
-    For each token in the query vector, look up its posting list in the inverted index
-    and accumulate the dot-product contributions from documents.
-    Then, convert the accumulated dot product to a cosine similarity using the document norm.
-    
-    Returns:
-        A dictionary mapping document IDs to their cosine similarity scores.
+    For each term in the query vector, add contributions to documents that contain the term.
+    Returns a dictionary mapping document IDs to the accumulated dot product between
+    the query and the document vectors.
     """
-    doc_scores = defaultdict(float)
-    
-    # For each token in the query vector, add contributions from each document
-    for token, q_weight in query_vector.items():
-        if token in inverted_index:
-            postings = inverted_index[token]["postings"]
-            for doc_id, doc_weight in postings.items():
-                doc_scores[doc_id] += q_weight * doc_weight
-    
-    # Compute cosine similarity by dividing by the product of norms
-    cosine_similarities = {}
-    for doc_id, dot_product in doc_scores.items():
-        doc_norm = doc_vector_lengths.get(doc_id, 0)
-        if doc_norm > 0 and query_norm > 0:
-            cosine_similarities[doc_id] = dot_product / (query_norm * doc_norm)
-    return cosine_similarities
+    scores = defaultdict(float)
+    for term, q_weight in query_vector.items():
+        # Only process terms that appear in the weighted index.
+        if term in weighted_dict:
+            for doc_id, d_weight in weighted_dict[term].items():
+                scores[doc_id] += q_weight * d_weight
+    return scores
 
 def main():
-    run_name = "run"
-    
-    # File paths (adjusted to your folder structure)
+    run_name = "myRun"
+    # File paths
     stopwords_file = "scifact/stopwords.txt"
-    inverted_index_file = "scifact/inverted_index.json"
-    doc_vector_lengths_file = "scifact/document_vector_lengths.json"
+    weighted_dict_file = "scifact/weighted_dict.json"
     queries_file = "scifact/queries.jsonl"
     results_file = "scifact/results.txt"
+    query_processed_file = "scifact/query_processed.json"
     
     # Load stopwords
     with open(stopwords_file, "r", encoding="utf-8") as f:
         stopwords = set(line.strip() for line in f)
     
-    # Load the inverted index (weighted index) produced by indexing.py
-    with open(inverted_index_file, "r", encoding="utf-8") as f:
-        inverted_index = json.load(f)
+    # Load the weighted dictionary (the inverted index with tf-idf weights)
+    with open(weighted_dict_file, "r", encoding="utf-8") as f:
+        weighted_dict = json.load(f)
+    vocab_size = len(weighted_dict)
     
-    # Load document vector lengths (norms)
-    with open(doc_vector_lengths_file, "r", encoding="utf-8") as f:
-        doc_vector_lengths = json.load(f)
+    # Precompute document norms for cosine similarity computations
+    doc_norms = compute_document_norms(weighted_dict)
     
-    # Total number of documents (needed for query IDF computation)
-    total_docs = len(doc_vector_lengths)
-    
-    # Load queries (each line is a JSON object)
+    # Load queries from queries.jsonl (each line is a JSON object)
     queries = []
     with open(queries_file, "r", encoding="utf-8") as f:
         for line in f:
@@ -116,32 +143,54 @@ def main():
             if line:
                 queries.append(json.loads(line))
     
-    # Open results file for writing
+    # Create a dictionary to store the processed queries
+    processed_queries = {}
+    
+    # Process each query and write ranked results
     with open(results_file, "w", encoding="utf-8") as out_f:
         for query_obj in queries:
-            # Assuming each query has fields "_id" and "text"
+            # Extract query id and text.
+            # Here, we assume each query JSON has fields "_id" and "text".
             qid = query_obj["_id"]
             q_text = query_obj["text"]
             
-            # Preprocess the query text
-            tokens = preprocess_query(q_text, stopwords)
+            # Preprocess the query text using the unified function
+            tokens = preprocess_text(q_text, stopwords)
+            # Store the processed tokens in our dictionary
+            processed_queries[qid] = tokens
             
-            # Build the query vector using TF * IDF
-            query_vector = build_query_vector(tokens, total_docs, inverted_index)
-            query_norm = compute_query_norm(query_vector)
+            query_vector = build_query_vector(tokens, weighted_dict, vocab_size)
+            if not query_vector:
+                continue  # Skip if the query has no valid tokens
             
-            # Retrieve documents and compute cosine similarity scores
-            cosine_similarities = retrieve_documents(query_vector, query_norm, inverted_index, doc_vector_lengths)
+            # Compute the norm of the query vector
+            q_norm = math.sqrt(sum(weight ** 2 for weight in query_vector.values()))
             
-            # Sort documents by descending similarity score
-            ranked_docs = sorted(cosine_similarities.items(), key=lambda x: x[1], reverse=True)
+            # Retrieve documents and accumulate dot product scores
+            raw_scores = retrieve_documents(query_vector, weighted_dict)
             
-            # Write top-100 results in the required format:
+            # Compute cosine similarity scores
+            cosine_scores = {}
+            for doc_id, dot_product in raw_scores.items():
+                if q_norm > 0 and doc_norms.get(doc_id, 0) > 0:
+                    cosine_scores[doc_id] = dot_product / (q_norm * doc_norms[doc_id])
+                else:
+                    cosine_scores[doc_id] = 0.0
+            
+            # Rank the documents by descending similarity score
+            ranked_docs = sorted(cosine_scores.items(), key=lambda x: x[1], reverse=True)
+            
+            # Write the top-100 results to the output file in the required format:
             # query_id Q0 doc_id rank score run_name
             for rank, (doc_id, score) in enumerate(ranked_docs[:100], start=1):
                 out_f.write(f"{qid} Q0 {doc_id} {rank} {score} {run_name}\n")
     
+    # Write the processed queries to a file
+    with open(query_processed_file, "w", encoding="utf-8") as qp_f:
+        json.dump(processed_queries, qp_f, indent=4)
+    
     print("Retrieval complete. Results saved to", results_file)
+    print("Processed queries saved to", query_processed_file)
 
 if __name__ == "__main__":
     main()
